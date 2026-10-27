@@ -1357,6 +1357,35 @@ mod tests {
     }
 
     #[test]
+    fn declared_azure_provider_options_reach_the_sdk_for_every_combination() {
+        for auto_register in [false, true] {
+            for (auto_linking, expected_linking) in [
+                (IdentityProviderAutoLinking::Unspecified, AutoLinkingOption::Unspecified),
+                (IdentityProviderAutoLinking::Username, AutoLinkingOption::Username),
+                (IdentityProviderAutoLinking::Email, AutoLinkingOption::Email),
+            ] {
+                for auto_update in [false, true] {
+                    let mut idp = azure_cr();
+                    idp.spec.auto_register = auto_register;
+                    let azure = match &mut idp.spec.inner {
+                        IdentityProviderInnerSpec::AzureAd(azure) => azure,
+                        other => panic!("parsed as {other:?}"),
+                    };
+                    azure.auto_linking = auto_linking;
+                    azure.auto_update = auto_update;
+
+                    let options = provider_options(auto_register, azure);
+                    assert_eq!(options.is_auto_creation, auto_register);
+                    assert_eq!(options.is_auto_update, auto_update);
+                    assert_eq!(options.auto_linking, i32::from(expected_linking));
+                    assert!(options.is_linking_allowed);
+                    assert!(options.is_creation_allowed);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_provider_built_from_the_spec_matches_it() {
         let idp = azure_cr();
         assert!(azure_ad_matches_spec(&provider_from(&idp), &idp));
@@ -1524,6 +1553,90 @@ mod tests {
             serde_json::from_value::<IdentityProviderSpec>(value)
                 .expect_err(&format!("clientSecretRef.{missing} must be required"));
         }
+    }
+
+    #[test]
+    fn azure_provider_linking_options_default_round_trip_and_reject_invalid_values() {
+        let defaults = azure_ad_spec_from(complete_azure_ad());
+        let default_idp = IdentityProvider::new("defaults", defaults.clone());
+        let default_azure = azure_ad_spec(&default_idp);
+        assert_eq!(default_azure.auto_linking, IdentityProviderAutoLinking::Unspecified);
+        assert!(default_azure.auto_update);
+
+        for (linking, expected) in [
+            ("Unspecified", IdentityProviderAutoLinking::Unspecified),
+            ("Username", IdentityProviderAutoLinking::Username),
+            ("Email", IdentityProviderAutoLinking::Email),
+        ] {
+            let mut value = complete_azure_ad();
+            value["autoLinking"] = serde_json::json!(linking);
+            value["autoUpdate"] = serde_json::json!(false);
+            let spec = azure_ad_spec_from(value);
+            let configured_idp = IdentityProvider::new("configured", spec.clone());
+            let azure = azure_ad_spec(&configured_idp);
+            assert_eq!(azure.auto_linking, expected);
+            assert!(!azure.auto_update);
+            let round_trip = serde_json::to_value(spec).unwrap();
+            assert_eq!(round_trip["azureAd"]["autoLinking"], linking);
+            assert_eq!(round_trip["azureAd"]["autoUpdate"], false);
+        }
+
+        for invalid in [
+            serde_json::json!("email"),
+            serde_json::json!("EMAIL"),
+            serde_json::json!(false),
+            serde_json::json!(null),
+        ] {
+            let mut value = complete_azure_ad();
+            value["autoLinking"] = invalid;
+            serde_json::from_value::<IdentityProviderSpec>(serde_json::json!({
+                "name": "Microsoft",
+                "organizationName": "legal",
+                "azureAd": value,
+            }))
+            .expect_err("invalid autoLinking must be rejected");
+        }
+
+        for invalid in [serde_json::json!("false"), serde_json::json!(0), serde_json::json!(null)] {
+            let mut value = complete_azure_ad();
+            value["autoUpdate"] = invalid;
+            serde_json::from_value::<IdentityProviderSpec>(serde_json::json!({
+                "name": "Microsoft",
+                "organizationName": "legal",
+                "azureAd": value,
+            }))
+            .expect_err("invalid autoUpdate must be rejected");
+        }
+    }
+
+    #[test]
+    fn identity_provider_crd_exposes_typed_defaulted_azure_options() {
+        let crd = serde_json::to_value(IdentityProvider::crd()).unwrap();
+        let properties = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["azureAd"]["properties"];
+        let azure_required = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["azureAd"]["required"];
+        let jwt_properties = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["jwt"]["properties"];
+
+        assert_eq!(properties["autoUpdate"]["type"], "boolean");
+        assert_eq!(properties["autoUpdate"]["default"], true);
+        assert_eq!(properties["autoLinking"]["type"], "string");
+        assert_eq!(properties["autoLinking"]["default"], "Unspecified");
+        assert_eq!(
+            properties["autoLinking"]["enum"],
+            serde_json::json!(["Unspecified", "Username", "Email"])
+        );
+        assert!(
+            !azure_required
+                .as_array()
+                .expect("azureAd has a required list")
+                .iter()
+                .any(|field| field == "autoLinking" || field == "autoUpdate"),
+            "defaulted Azure options must remain optional"
+        );
+        assert!(jwt_properties.get("autoLinking").is_none());
+        assert!(jwt_properties.get("autoUpdate").is_none());
     }
 
     /// The selector carries no namespace: one would let whoever may create an

@@ -24,7 +24,7 @@ use zitadel::api::zitadel::{
     idp::v1::{azure_ad_tenant, provider_config, IdpOwnerType, IdpStylingType, Options, ProviderType},
     management::v1::{
         AddAzureAdProviderRequest, AddIdpToLoginPolicyRequest, AddOrgJwtidpRequest, GetLoginPolicyRequest,
-        GetProviderByIdRequest, ListLoginPolicyIdPsRequest,
+        GetProviderByIdRequest, ListLoginPolicyIdPsRequest, UpdateAzureAdProviderRequest,
     },
 };
 use zitadel_operator::{
@@ -135,6 +135,38 @@ fn azure_ad_cr(idp_name: &str, org_name: &str, secret_name: &str, email_verified
     })
 }
 
+fn azure_ad_cr_with_options(
+    idp_name: &str,
+    org_name: &str,
+    secret_name: &str,
+    email_verified: bool,
+    auto_linking: &str,
+    auto_update: bool,
+) -> serde_json::Value {
+    json!({
+        "apiVersion": IdentityProvider::api_version(&()),
+        "kind": "IdentityProvider",
+        "metadata": { "name": idp_name, "namespace": NAMESPACE },
+        "spec": {
+            "name": idp_name,
+            "organizationName": org_name,
+            "autoRegister": true,
+            "showOnLoginScreen": true,
+            "azureAd": {
+                "tenantId": TENANT_ID,
+                "clientId": CLIENT_ID,
+                "clientSecretRef": {
+                    "name": secret_name,
+                    "key": "client-secret",
+                },
+                "emailVerified": email_verified,
+                "autoLinking": auto_linking,
+                "autoUpdate": auto_update,
+            },
+        },
+    })
+}
+
 async fn create_org(fixture: &TestFixture, org_name: &str) -> Result<String> {
     let orgs: Api<Organization> = Api::all(fixture.k8s_client.clone());
     orgs.patch(
@@ -225,6 +257,154 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
         "the provider is not pinned to the tenant the resource names"
     );
 
+    idps.patch(
+        &idp_name,
+        &PatchParams::apply("e2e").force(),
+        &Patch::Apply(azure_ad_cr_with_options(
+            &idp_name,
+            &org_name,
+            &secret_name,
+            true,
+            "Username",
+            true,
+        )),
+    )
+    .await?;
+    wait_for(Duration::from_secs(120), || {
+        let mut management = management.clone();
+        let org_id = org_id.clone();
+        let idp_id = idp_id.clone();
+        async move {
+            let provider = get_provider(&mut management, &org_id, &idp_id).await?;
+            Ok(provider_options_are(&provider, true, 1).then_some(()))
+        }
+    })
+    .await
+    .context("the provider never applied the declared Username option")?;
+    assert_eq!(
+        idps.get(&idp_name).await?.status.expect("status disappeared").id,
+        idp_id,
+        "changing provider options replaced the existing provider"
+    );
+
+    idps.patch(
+        &idp_name,
+        &PatchParams::apply("e2e").force(),
+        &Patch::Apply(azure_ad_cr_with_options(
+            &idp_name,
+            &org_name,
+            &secret_name,
+            true,
+            "Username",
+            false,
+        )),
+    )
+    .await?;
+    wait_for(Duration::from_secs(120), || {
+        let mut management = management.clone();
+        let org_id = org_id.clone();
+        let idp_id = idp_id.clone();
+        async move {
+            let provider = get_provider(&mut management, &org_id, &idp_id).await?;
+            Ok(provider_options_are(&provider, false, 1).then_some(()))
+        }
+    })
+    .await
+    .context("the provider never applied the declared autoUpdate option")?;
+
+    management
+        .update_azure_ad_provider(with_org(
+            UpdateAzureAdProviderRequest {
+                id: idp_id.clone(),
+                name: idp_name.clone(),
+                client_id: CLIENT_ID.to_string(),
+                client_secret: "first-client-secret".to_string(),
+                tenant: Some(zitadel::api::zitadel::idp::v1::AzureAdTenant {
+                    r#type: Some(azure_ad_tenant::Type::TenantId(TENANT_ID.to_string())),
+                }),
+                email_verified: true,
+                scopes: vec![],
+                provider_options: Some(Options {
+                    is_linking_allowed: true,
+                    is_creation_allowed: true,
+                    is_auto_creation: true,
+                    is_auto_update: false,
+                    auto_linking: 2,
+                }),
+            },
+            &org_id,
+        ))
+        .await?;
+    wait_for(Duration::from_secs(120), || {
+        let mut management = management.clone();
+        let org_id = org_id.clone();
+        let idp_id = idp_id.clone();
+        async move {
+            let provider = get_provider(&mut management, &org_id, &idp_id).await?;
+            Ok(provider_options_are(&provider, false, 1).then_some(()))
+        }
+    })
+    .await
+    .context("the operator did not repair autoLinking drift")?;
+
+    management
+        .update_azure_ad_provider(with_org(
+            UpdateAzureAdProviderRequest {
+                id: idp_id.clone(),
+                name: idp_name.clone(),
+                client_id: CLIENT_ID.to_string(),
+                client_secret: "first-client-secret".to_string(),
+                tenant: Some(zitadel::api::zitadel::idp::v1::AzureAdTenant {
+                    r#type: Some(azure_ad_tenant::Type::TenantId(TENANT_ID.to_string())),
+                }),
+                email_verified: true,
+                scopes: vec![],
+                provider_options: Some(Options {
+                    is_linking_allowed: true,
+                    is_creation_allowed: true,
+                    is_auto_creation: true,
+                    is_auto_update: false,
+                    auto_linking: 1,
+                }),
+            },
+            &org_id,
+        ))
+        .await?;
+    wait_for(Duration::from_secs(120), || {
+        let mut management = management.clone();
+        let org_id = org_id.clone();
+        let idp_id = idp_id.clone();
+        async move {
+            let provider = get_provider(&mut management, &org_id, &idp_id).await?;
+            Ok(provider_options_are(&provider, true, 1).then_some(()))
+        }
+    })
+    .await
+    .context("the operator did not repair provider-option drift")?;
+
+    idps.patch(
+        &idp_name,
+        &PatchParams::default(),
+        &Patch::Merge(json!({ "spec": { "azureAd": { "autoLinking": null, "autoUpdate": null } } })),
+    )
+    .await?;
+    wait_for(Duration::from_secs(120), || {
+        let mut management = management.clone();
+        let org_id = org_id.clone();
+        let idp_id = idp_id.clone();
+        async move {
+            let provider = get_provider(&mut management, &org_id, &idp_id).await?;
+            Ok(provider_options_are(&provider, true, 0).then_some(()))
+        }
+    })
+    .await
+    .context("removing Azure provider options did not restore their defaults")?;
+    assert_eq!(
+        idps.get(&idp_name).await?.status.expect("status disappeared").id,
+        idp_id,
+        "removing provider options replaced the existing provider"
+    );
+
     wait_for(Duration::from_secs(120), || {
         let mut management = management.clone();
         let org_id = org_id.clone();
@@ -248,6 +428,10 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
     .await
     .context("the rotated client secret was never pushed to ZITADEL")?;
     assert_ne!(rotated, first_hash);
+    assert!(
+        provider_options_are(&get_provider(&mut management, &org_id, &idp_id).await?, true, 0),
+        "rotating a client secret changed the restored provider options"
+    );
 
     // A rotation must not replace the provider: users already linked to it keep
     // their link only as long as its id survives.
@@ -266,6 +450,10 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
         change_date(&mut management, &org_id, &idp_id).await?,
         settled,
         "a settled provider is being rewritten on every requeue"
+    );
+    assert!(
+        provider_options_are(&get_provider(&mut management, &org_id, &idp_id).await?, true, 0),
+        "a settled provider changed the restored provider options"
     );
 
     idps.delete(&idp_name, &kube::api::DeleteParams::default()).await?;
@@ -353,6 +541,43 @@ async fn an_existing_azure_ad_provider_is_adopted(fixture: &TestFixture) -> Resu
         adopted, existing_id,
         "the operator created a second provider instead of adopting the existing one"
     );
+
+    wait_for(Duration::from_secs(120), || {
+        let mut management = management.clone();
+        let org_id = org_id.clone();
+        let existing_id = existing_id.clone();
+        async move {
+            let provider = get_provider(&mut management, &org_id, &existing_id).await?;
+            Ok(provider_options_are(&provider, true, 0).then_some(()))
+        }
+    })
+    .await
+    .context("the adopted provider did not retain omitted provider-option defaults")?;
+
+    idps.patch(
+        &idp_name,
+        &PatchParams::apply("e2e").force(),
+        &Patch::Apply(azure_ad_cr_with_options(
+            &idp_name,
+            &org_name,
+            &secret_name,
+            true,
+            "Email",
+            false,
+        )),
+    )
+    .await?;
+    wait_for(Duration::from_secs(120), || {
+        let mut management = management.clone();
+        let org_id = org_id.clone();
+        let existing_id = existing_id.clone();
+        async move {
+            let provider = get_provider(&mut management, &org_id, &existing_id).await?;
+            Ok(provider_options_are(&provider, false, 2).then_some(()))
+        }
+    })
+    .await
+    .context("the adopted provider never converged to declared options")?;
 
     // Adoption records no hash, so a later reconcile has to replace the
     // credential the operator does not know with the one the Secret holds. The
@@ -492,6 +717,29 @@ async fn an_unpinned_tenant_is_refused_by_the_api_server(fixture: &TestFixture) 
         assert!(
             refused.contains("tenantId") || refused.contains("pattern"),
             "tenantId '{selector}' was refused for an unrelated reason: {refused}"
+        );
+    }
+
+    for (field, invalid) in [
+        ("autoLinking", json!("email")),
+        ("autoUpdate", json!("false")),
+    ] {
+        let suffix = std::process::id();
+        let name = match field {
+            "autoLinking" => format!("invalid-linking-{suffix}"),
+            "autoUpdate" => format!("invalid-update-{suffix}"),
+            _ => unreachable!(),
+        };
+        let mut cr = azure_ad_cr(&name, "irrelevant", "irrelevant", true);
+        cr["spec"]["azureAd"][field] = invalid;
+        let refused = idps
+            .patch(&name, &PatchParams::apply("e2e").force(), &Patch::Apply(cr))
+            .await
+            .expect_err(&format!("the API server accepted invalid {field}"))
+            .to_string();
+        assert!(
+            refused.contains(&format!("spec.azureAd.{field}")),
+            "{field} was refused without its schema path: {refused}"
         );
     }
 
@@ -689,6 +937,18 @@ async fn get_provider(
         .into_inner()
         .idp
         .ok_or_else(|| anyhow!("ZITADEL has no provider with id {idp_id}"))
+}
+
+fn provider_options_are(
+    provider: &zitadel::api::zitadel::idp::v1::Provider,
+    auto_update: bool,
+    auto_linking: i32,
+) -> bool {
+    provider
+        .config
+        .as_ref()
+        .and_then(|config| config.options.as_ref())
+        .is_some_and(|options| options.is_auto_update == auto_update && options.auto_linking == auto_linking)
 }
 
 async fn the_provider_is_offered(fixture: &TestFixture) -> Result<()> {
