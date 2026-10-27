@@ -545,7 +545,7 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
 }
 
 async fn an_azure_ad_provider_defaults_when_options_are_omitted(fixture: &TestFixture) -> Result<()> {
-    let mut management = fixture
+    let management = fixture
         .zitadel_builder
         .builder()
         .build_management_client()
