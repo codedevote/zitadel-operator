@@ -1392,6 +1392,35 @@ mod tests {
     }
 
     #[test]
+    fn non_default_azure_options_match_only_the_declared_values() {
+        let mut idp = azure_cr();
+        let azure = match &mut idp.spec.inner {
+            IdentityProviderInnerSpec::AzureAd(azure) => azure,
+            other => panic!("parsed as {other:?}"),
+        };
+        azure.auto_linking = IdentityProviderAutoLinking::Email;
+        azure.auto_update = false;
+
+        let expected = provider_from(&idp);
+        assert!(azure_ad_matches_spec(&expected, &idp));
+
+        for actual_options in [
+            Options {
+                auto_linking: AutoLinkingOption::Username.into(),
+                ..provider_options(idp.spec.auto_register, azure_ad_spec(&idp))
+            },
+            Options {
+                is_auto_update: true,
+                ..provider_options(idp.spec.auto_register, azure_ad_spec(&idp))
+            },
+        ] {
+            let mut changed = expected.clone();
+            changed.config.as_mut().unwrap().options = Some(actual_options);
+            assert!(!azure_ad_matches_spec(&changed, &idp), "{actual_options:?} is drift");
+        }
+    }
+
+    #[test]
     fn every_comparable_field_is_part_of_the_drift_check() {
         let idp = azure_cr();
 
@@ -1597,7 +1626,11 @@ mod tests {
             .expect_err("invalid autoLinking must be rejected");
         }
 
-        for invalid in [serde_json::json!("false"), serde_json::json!(0), serde_json::json!(null)] {
+        for invalid in [
+            serde_json::json!("false"),
+            serde_json::json!(0),
+            serde_json::json!(null),
+        ] {
             let mut value = complete_azure_ad();
             value["autoUpdate"] = invalid;
             serde_json::from_value::<IdentityProviderSpec>(serde_json::json!({
@@ -1612,8 +1645,8 @@ mod tests {
     #[test]
     fn identity_provider_crd_exposes_typed_defaulted_azure_options() {
         let crd = serde_json::to_value(IdentityProvider::crd()).unwrap();
-        let properties = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
-            ["properties"]["azureAd"]["properties"];
+        let properties = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+            ["azureAd"]["properties"];
         let azure_required = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
             ["properties"]["azureAd"]["required"];
         let jwt_properties = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]

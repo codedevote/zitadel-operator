@@ -71,9 +71,15 @@ async fn login_screen_membership_on_a_new_organization() -> Result<()> {
     an_azure_ad_provider_is_managed_declaratively(fixture)
         .await
         .context("an azureAd provider created, rotated and deleted")?;
+    an_azure_ad_provider_defaults_when_options_are_omitted(fixture)
+        .await
+        .context("an azureAd provider created with omitted option defaults")?;
     an_existing_azure_ad_provider_is_adopted(fixture)
         .await
         .context("an azureAd provider adopted by name")?;
+    an_existing_azure_ad_provider_converges_to_initial_non_default_options(fixture)
+        .await
+        .context("an azureAd provider adopted into non-default options")?;
     a_name_held_by_another_provider_type_is_refused(fixture)
         .await
         .context("an azureAd provider refused a name a jwt provider holds")?;
@@ -211,7 +217,14 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
     idps.patch(
         &idp_name,
         &PatchParams::apply("e2e").force(),
-        &Patch::Apply(azure_ad_cr(&idp_name, &org_name, &secret_name, true)),
+        &Patch::Apply(azure_ad_cr_with_options(
+            &idp_name,
+            &org_name,
+            &secret_name,
+            true,
+            "Email",
+            false,
+        )),
     )
     .await?;
 
@@ -239,8 +252,8 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
             is_linking_allowed: true,
             is_creation_allowed: true,
             is_auto_creation: true,
-            is_auto_update: true,
-            auto_linking: 0,
+            is_auto_update: false,
+            auto_linking: 2,
         }),
         "provider options did not survive the round trip"
     );
@@ -266,6 +279,36 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
             &secret_name,
             true,
             "Username",
+            false,
+        )),
+    )
+    .await?;
+    wait_for(Duration::from_secs(120), || {
+        let mut management = management.clone();
+        let org_id = org_id.clone();
+        let idp_id = idp_id.clone();
+        async move {
+            let provider = get_provider(&mut management, &org_id, &idp_id).await?;
+            Ok(provider_options_are(&provider, false, 1).then_some(()))
+        }
+    })
+    .await
+    .context("the provider never applied the declared Username option")?;
+    assert_eq!(
+        idps.get(&idp_name).await?.status.expect("status disappeared").id,
+        idp_id,
+        "changing provider options replaced the existing provider"
+    );
+
+    idps.patch(
+        &idp_name,
+        &PatchParams::apply("e2e").force(),
+        &Patch::Apply(azure_ad_cr_with_options(
+            &idp_name,
+            &org_name,
+            &secret_name,
+            true,
+            "Username",
             true,
         )),
     )
@@ -280,12 +323,7 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
         }
     })
     .await
-    .context("the provider never applied the declared Username option")?;
-    assert_eq!(
-        idps.get(&idp_name).await?.status.expect("status disappeared").id,
-        idp_id,
-        "changing provider options replaced the existing provider"
-    );
+    .context("the provider never applied the declared autoUpdate option")?;
 
     idps.patch(
         &idp_name,
@@ -310,7 +348,7 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
         }
     })
     .await
-    .context("the provider never applied the declared autoUpdate option")?;
+    .context("the provider never restored the declared autoUpdate option")?;
 
     management
         .update_azure_ad_provider(with_org(
@@ -363,7 +401,7 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
                     is_linking_allowed: true,
                     is_creation_allowed: true,
                     is_auto_creation: true,
-                    is_auto_update: false,
+                    is_auto_update: true,
                     auto_linking: 1,
                 }),
             },
@@ -376,7 +414,7 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
         let idp_id = idp_id.clone();
         async move {
             let provider = get_provider(&mut management, &org_id, &idp_id).await?;
-            Ok(provider_options_are(&provider, true, 1).then_some(()))
+            Ok(provider_options_are(&provider, false, 1).then_some(()))
         }
     })
     .await
@@ -384,8 +422,15 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
 
     idps.patch(
         &idp_name,
-        &PatchParams::default(),
-        &Patch::Merge(json!({ "spec": { "azureAd": { "autoLinking": null, "autoUpdate": null } } })),
+        &PatchParams::apply("e2e").force(),
+        &Patch::Apply(azure_ad_cr_with_options(
+            &idp_name,
+            &org_name,
+            &secret_name,
+            true,
+            "Email",
+            false,
+        )),
     )
     .await?;
     wait_for(Duration::from_secs(120), || {
@@ -394,15 +439,15 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
         let idp_id = idp_id.clone();
         async move {
             let provider = get_provider(&mut management, &org_id, &idp_id).await?;
-            Ok(provider_options_are(&provider, true, 0).then_some(()))
+            Ok(provider_options_are(&provider, false, 2).then_some(()))
         }
     })
     .await
-    .context("removing Azure provider options did not restore their defaults")?;
+    .context("the provider never restored the declared Email option")?;
     assert_eq!(
         idps.get(&idp_name).await?.status.expect("status disappeared").id,
         idp_id,
-        "removing provider options replaced the existing provider"
+        "changing provider options replaced the existing provider"
     );
 
     wait_for(Duration::from_secs(120), || {
@@ -429,8 +474,8 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
     .context("the rotated client secret was never pushed to ZITADEL")?;
     assert_ne!(rotated, first_hash);
     assert!(
-        provider_options_are(&get_provider(&mut management, &org_id, &idp_id).await?, true, 0),
-        "rotating a client secret changed the restored provider options"
+        provider_options_are(&get_provider(&mut management, &org_id, &idp_id).await?, false, 2),
+        "rotating a client secret changed the declared provider options"
     );
 
     // A rotation must not replace the provider: users already linked to it keep
@@ -452,8 +497,31 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
         "a settled provider is being rewritten on every requeue"
     );
     assert!(
-        provider_options_are(&get_provider(&mut management, &org_id, &idp_id).await?, true, 0),
-        "a settled provider changed the restored provider options"
+        provider_options_are(&get_provider(&mut management, &org_id, &idp_id).await?, false, 2),
+        "a settled provider changed the declared provider options"
+    );
+
+    idps.patch(
+        &idp_name,
+        &PatchParams::default(),
+        &Patch::Merge(json!({ "spec": { "azureAd": { "autoLinking": null, "autoUpdate": null } } })),
+    )
+    .await?;
+    wait_for(Duration::from_secs(120), || {
+        let mut management = management.clone();
+        let org_id = org_id.clone();
+        let idp_id = idp_id.clone();
+        async move {
+            let provider = get_provider(&mut management, &org_id, &idp_id).await?;
+            Ok(provider_options_are(&provider, true, 0).then_some(()))
+        }
+    })
+    .await
+    .context("removing Azure provider options did not restore their defaults")?;
+    assert_eq!(
+        idps.get(&idp_name).await?.status.expect("status disappeared").id,
+        idp_id,
+        "removing provider options replaced the existing provider"
     );
 
     idps.delete(&idp_name, &kube::api::DeleteParams::default()).await?;
@@ -472,6 +540,66 @@ async fn an_azure_ad_provider_is_managed_declaratively(fixture: &TestFixture) ->
     })
     .await
     .context("deleting the resource left the provider in ZITADEL")?;
+
+    Ok(())
+}
+
+async fn an_azure_ad_provider_defaults_when_options_are_omitted(fixture: &TestFixture) -> Result<()> {
+    let mut management = fixture
+        .zitadel_builder
+        .builder()
+        .build_management_client()
+        .await
+        .map_err(|e| anyhow!("{e:?}"))?;
+
+    let suffix = std::process::id();
+    let org_name = format!("idp-defaults-{suffix}");
+    let idp_name = format!("microsoft-defaults-{suffix}");
+    let secret_name = format!("entra-defaults-{suffix}");
+
+    put_client_secret(fixture, &secret_name, "default-client-secret").await?;
+    let org_id = create_org(fixture, &org_name).await?;
+    let idps: Api<IdentityProvider> = Api::namespaced(fixture.k8s_client.clone(), NAMESPACE);
+    idps.patch(
+        &idp_name,
+        &PatchParams::apply("e2e").force(),
+        &Patch::Apply(azure_ad_cr(&idp_name, &org_name, &secret_name, true)),
+    )
+    .await?;
+
+    let idp_id = wait_for(Duration::from_secs(120), || async {
+        Ok(idps.get(&idp_name).await?.status.map(|status| status.id))
+    })
+    .await
+    .context("the operator never created the omitted-options Azure provider")?;
+    wait_for(Duration::from_secs(120), || {
+        let mut management = management.clone();
+        let org_id = org_id.clone();
+        let idp_id = idp_id.clone();
+        async move {
+            let provider = get_provider(&mut management, &org_id, &idp_id).await?;
+            Ok(provider_options_are(&provider, true, 0).then_some(()))
+        }
+    })
+    .await
+    .context("the omitted Azure options did not use their defaults")?;
+
+    idps.delete(&idp_name, &kube::api::DeleteParams::default()).await?;
+    wait_for(Duration::from_secs(120), || {
+        let mut management = management.clone();
+        let org_id = org_id.clone();
+        let idp_id = idp_id.clone();
+        async move {
+            let gone = management
+                .get_provider_by_id(with_org(GetProviderByIdRequest { id: idp_id }, &org_id))
+                .await
+                .err()
+                .is_some_and(|e| e.code() == Code::NotFound);
+            Ok(gone.then_some(()))
+        }
+    })
+    .await
+    .context("deleting the omitted-options resource left its provider in ZITADEL")?;
 
     Ok(())
 }
@@ -610,6 +738,81 @@ async fn an_existing_azure_ad_provider_is_adopted(fixture: &TestFixture) -> Resu
     Ok(())
 }
 
+async fn an_existing_azure_ad_provider_converges_to_initial_non_default_options(fixture: &TestFixture) -> Result<()> {
+    let mut management = fixture
+        .zitadel_builder
+        .builder()
+        .build_management_client()
+        .await
+        .map_err(|e| anyhow!("{e:?}"))?;
+
+    let suffix = std::process::id();
+    let org_name = format!("idp-adopt-nondefault-{suffix}");
+    let idp_name = format!("microsoft-adopt-nondefault-{suffix}");
+    let secret_name = format!("entra-adopt-nondefault-{suffix}");
+    put_client_secret(fixture, &secret_name, "nondefault-adopted-secret").await?;
+    let org_id = create_org(fixture, &org_name).await?;
+    let existing_id = management
+        .add_azure_ad_provider(with_org(
+            AddAzureAdProviderRequest {
+                name: idp_name.clone(),
+                client_id: CLIENT_ID.to_string(),
+                client_secret: "created-outside-the-operator".to_string(),
+                tenant: Some(zitadel::api::zitadel::idp::v1::AzureAdTenant {
+                    r#type: Some(azure_ad_tenant::Type::TenantId(TENANT_ID.to_string())),
+                }),
+                email_verified: true,
+                scopes: vec![],
+                provider_options: Some(Options {
+                    is_linking_allowed: true,
+                    is_creation_allowed: true,
+                    is_auto_creation: true,
+                    is_auto_update: true,
+                    auto_linking: 0,
+                }),
+            },
+            &org_id,
+        ))
+        .await?
+        .into_inner()
+        .id;
+
+    let idps: Api<IdentityProvider> = Api::namespaced(fixture.k8s_client.clone(), NAMESPACE);
+    idps.patch(
+        &idp_name,
+        &PatchParams::apply("e2e").force(),
+        &Patch::Apply(azure_ad_cr_with_options(
+            &idp_name,
+            &org_name,
+            &secret_name,
+            true,
+            "Email",
+            false,
+        )),
+    )
+    .await?;
+    let adopted = wait_for(Duration::from_secs(120), || async {
+        Ok(idps.get(&idp_name).await?.status.map(|status| status.id))
+    })
+    .await
+    .context("the operator never adopted the non-default Azure provider")?;
+    assert_eq!(adopted, existing_id, "the non-default provider was not adopted");
+    wait_for(Duration::from_secs(120), || {
+        let mut management = management.clone();
+        let org_id = org_id.clone();
+        let existing_id = existing_id.clone();
+        async move {
+            let provider = get_provider(&mut management, &org_id, &existing_id).await?;
+            Ok(provider_options_are(&provider, false, 2).then_some(()))
+        }
+    })
+    .await
+    .context("the adopted provider did not converge to initial non-default options")?;
+
+    idps.delete(&idp_name, &kube::api::DeleteParams::default()).await?;
+    Ok(())
+}
+
 /// Adoption keys on the display name, and a provider of another kind can answer
 /// to it. Taking that one over would swap out an identity source the
 /// organization's users are already linked to, so the operator must refuse.
@@ -720,10 +923,7 @@ async fn an_unpinned_tenant_is_refused_by_the_api_server(fixture: &TestFixture) 
         );
     }
 
-    for (field, invalid) in [
-        ("autoLinking", json!("email")),
-        ("autoUpdate", json!("false")),
-    ] {
+    for (field, invalid) in [("autoLinking", json!("email")), ("autoUpdate", json!("false"))] {
         let suffix = std::process::id();
         let name = match field {
             "autoLinking" => format!("invalid-linking-{suffix}"),
