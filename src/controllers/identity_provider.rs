@@ -1,7 +1,7 @@
 use crate::{
     schema::{
-        IdentityProvider, IdentityProviderAzureAdSpec, IdentityProviderInnerSpec, IdentityProviderJwtSpec,
-        IdentityProviderPhase, IdentityProviderStatus, Organization,
+        IdentityProvider, IdentityProviderAutoLinking, IdentityProviderAzureAdSpec, IdentityProviderInnerSpec,
+        IdentityProviderJwtSpec, IdentityProviderPhase, IdentityProviderStatus, Organization,
     },
     util::{
         create_request_with_org_id, patch_status, requeue_secs, CurrentState, CurrentStateParameters,
@@ -108,15 +108,18 @@ fn pinned_tenant(tenant_id: &str) -> AzureAdTenant {
     }
 }
 
-/// Zitadel's console defaults for an Azure AD provider, with `autoRegister`
-/// carried over from the spec the same way the jwt variant does it.
-fn provider_options(auto_register: bool) -> Options {
+fn provider_options(auto_register: bool, azure: &IdentityProviderAzureAdSpec) -> Options {
     Options {
         is_linking_allowed: true,
         is_creation_allowed: true,
         is_auto_creation: auto_register,
-        is_auto_update: true,
-        auto_linking: AutoLinkingOption::Unspecified.into(),
+        is_auto_update: azure.auto_update,
+        auto_linking: match azure.auto_linking {
+            IdentityProviderAutoLinking::Unspecified => AutoLinkingOption::Unspecified,
+            IdentityProviderAutoLinking::Username => AutoLinkingOption::Username,
+            IdentityProviderAutoLinking::Email => AutoLinkingOption::Email,
+        }
+        .into(),
     }
 }
 
@@ -137,7 +140,7 @@ fn azure_ad_matches_spec(object: &Provider, idp: &IdentityProvider) -> bool {
         return false;
     };
     object.name == idp.spec.name
-        && config.options == Some(provider_options(idp.spec.auto_register))
+        && config.options == Some(provider_options(idp.spec.auto_register, azure))
         && azure_config.client_id == azure.client_id
         && azure_config.tenant == Some(pinned_tenant(&azure.tenant_id))
         && azure_config.email_verified == azure.email_verified
@@ -861,7 +864,7 @@ async fn reconcile_azure_ad(
                         tenant: Some(pinned_tenant(&azure.tenant_id)),
                         email_verified: azure.email_verified,
                         scopes: vec![],
-                        provider_options: Some(provider_options(idp.spec.auto_register)),
+                        provider_options: Some(provider_options(idp.spec.auto_register, azure)),
                     },
                     org.id.clone(),
                 ))
@@ -901,7 +904,7 @@ async fn reconcile_azure_ad(
                         tenant: Some(pinned_tenant(&azure.tenant_id)),
                         email_verified: azure.email_verified,
                         scopes: vec![],
-                        provider_options: Some(provider_options(idp.spec.auto_register)),
+                        provider_options: Some(provider_options(idp.spec.auto_register, azure)),
                     },
                     org.id.clone(),
                 ))
@@ -1197,6 +1200,8 @@ mod tests {
                     key: "client-secret".to_string(),
                 },
                 email_verified: true,
+                auto_linking: IdentityProviderAutoLinking::Unspecified,
+                auto_update: true,
             }),
         };
         IdentityProvider::new("legal-entra-idp", spec)
@@ -1212,7 +1217,7 @@ mod tests {
             owner: IdpOwnerType::Org.into(),
             r#type: ProviderType::AzureAd.into(),
             config: Some(Config {
-                options: Some(provider_options(idp.spec.auto_register)),
+                options: Some(provider_options(idp.spec.auto_register, azure)),
                 config: Some(ProviderConfig::AzureAd(AzureAdConfig {
                     client_id: azure.client_id.clone(),
                     tenant: Some(pinned_tenant(&azure.tenant_id)),
@@ -1334,10 +1339,12 @@ mod tests {
 
     #[test]
     fn auto_register_drives_auto_creation_only() {
-        assert!(provider_options(true).is_auto_creation);
-        assert!(!provider_options(false).is_auto_creation);
+        let idp = azure_cr();
+        let azure = azure_ad_spec(&idp);
+        assert!(provider_options(true, azure).is_auto_creation);
+        assert!(!provider_options(false, azure).is_auto_creation);
         for auto_register in [true, false] {
-            let options = provider_options(auto_register);
+            let options = provider_options(auto_register, azure);
             assert!(options.is_auto_update, "Entra stays the source of truth for profiles");
             assert!(options.is_linking_allowed);
             assert!(options.is_creation_allowed);
@@ -1383,7 +1390,7 @@ mod tests {
         assert!(!azure_ad_matches_spec(&unverified, &idp), "emailVerified");
 
         let mut no_auto_register = provider_from(&idp);
-        no_auto_register.config.as_mut().unwrap().options = Some(provider_options(false));
+        no_auto_register.config.as_mut().unwrap().options = Some(provider_options(false, azure_ad_spec(&idp)));
         assert!(!azure_ad_matches_spec(&no_auto_register, &idp), "autoRegister");
 
         let mut scoped = provider_from(&idp);
@@ -1400,7 +1407,7 @@ mod tests {
     #[test]
     fn an_option_changed_in_the_console_counts_as_drift() {
         let idp = azure_cr();
-        let base = provider_options(idp.spec.auto_register);
+        let base = provider_options(idp.spec.auto_register, azure_ad_spec(&idp));
 
         let mut edits = vec![];
         for flip in [
